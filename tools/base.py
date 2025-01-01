@@ -1,12 +1,13 @@
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass, fields, replace
-from typing import Any
+from typing import Any, Dict
 
 from anthropic.types.beta import BetaToolUnionParam
+from google.generativeai.types import FunctionDeclaration
 
 
 class BaseAnthropicTool(metaclass=ABCMeta):
-    """Abstract base class for Anthropic-defined tools."""
+    """Abstract base class for Anthropic and Gemini-defined tools."""
 
     @abstractmethod
     def __call__(self, **kwargs) -> Any:
@@ -18,6 +19,57 @@ class BaseAnthropicTool(metaclass=ABCMeta):
         self,
     ) -> BetaToolUnionParam:
         raise NotImplementedError
+
+    def to_gemini_tool(self) -> FunctionDeclaration:
+        """Convert the tool definition to Gemini's FunctionDeclaration format."""
+        anthropic_params = self.to_params()
+        
+        if not isinstance(anthropic_params, dict):
+            raise ValueError("Tool params must be a dictionary")
+        
+        function_name = anthropic_params.get("function", {}).get("name", "")
+        description = anthropic_params.get("function", {}).get("description", "")
+        parameters = anthropic_params.get("function", {}).get("parameters", {})
+        
+        # Convert JSON Schema type parameters to Gemini's format
+        def convert_params(params: Dict) -> Dict:
+            if "type" not in params:
+                return params
+            
+            # Handle required fields
+            required = params.get("required", [])
+            properties = params.get("properties", {})
+            
+            # Mark required fields in properties
+            for prop_name, prop_details in properties.items():
+                if prop_name in required:
+                    prop_details["required"] = True
+            
+            # Convert type names if needed
+            type_mapping = {
+                "integer": "number",
+                "array": "list",
+                # Add more mappings if needed
+            }
+            
+            params_type = params["type"]
+            if params_type in type_mapping:
+                params["type"] = type_mapping[params_type]
+            
+            if "properties" in params:
+                for prop in params["properties"].values():
+                    if isinstance(prop, dict):
+                        convert_params(prop)
+            
+            return params
+        
+        converted_parameters = convert_params(parameters)
+        
+        return FunctionDeclaration(
+            name=function_name,
+            description=description,
+            parameters=converted_parameters
+        )
 
 
 @dataclass(kw_only=True, frozen=True)

@@ -1,5 +1,5 @@
 """
-Agentic sampling loop that calls the Anthropic API and local implementation of anthropic-defined computer use tools.
+Agentic sampling loop that supports both Anthropic API and Google's Gemini API, with local implementation of computer use tools.
 """
 
 import platform
@@ -7,6 +7,7 @@ from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, cast
+import json
 
 from anthropic import Anthropic, AnthropicBedrock, AnthropicVertex, APIResponse
 from anthropic.types import (
@@ -22,6 +23,9 @@ from anthropic.types.beta import (
     BetaToolResultBlockParam,
 )
 
+import google.generativeai as genai
+from google.generativeai.types import FunctionDeclaration
+
 from tools import BashTool, ComputerTool, EditTool, ToolCollection, ToolResult
 
 BETA_FLAG = "computer-use-2024-10-22"
@@ -31,12 +35,14 @@ class APIProvider(StrEnum):
     ANTHROPIC = "anthropic"
     BEDROCK = "bedrock"
     VERTEX = "vertex"
+    GEMINI = "gemini"
 
 
 PROVIDER_TO_DEFAULT_MODEL_NAME: dict[APIProvider, str] = {
     APIProvider.ANTHROPIC: "claude-3-5-sonnet-20241022",
     APIProvider.BEDROCK: "anthropic.claude-3-5-sonnet-20241022-v2:0",
     APIProvider.VERTEX: "claude-3-5-sonnet-v2@20241022",
+    APIProvider.GEMINI: "gemini-exp-1206",
 }
 
 
@@ -109,7 +115,7 @@ async def sampling_loop(
     max_tokens: int = 4096,
 ):
     """
-    Agentic sampling loop for the assistant/tool interaction of computer use.
+    Agentic sampling loop for the assistant/tool interaction using either Anthropic or Gemini API.
     """
     tool_collection = ToolCollection(
         ComputerTool(),
@@ -124,50 +130,121 @@ async def sampling_loop(
         if only_n_most_recent_images:
             _maybe_filter_to_n_most_recent_images(messages, only_n_most_recent_images)
 
-        if provider == APIProvider.ANTHROPIC:
-            client = Anthropic(api_key=api_key)
-        elif provider == APIProvider.VERTEX:
-            client = AnthropicVertex()
-        elif provider == APIProvider.BEDROCK:
-            client = AnthropicBedrock()
+        if provider == APIProvider.GEMINI:
+            # Configure Gemini
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_name=model)
 
-        # Call the API
-        # we use raw_response to provide debug information to streamlit. Your
-        # implementation may be able call the SDK directly with:
-        # `response = client.messages.create(...)` instead.
-        raw_response = client.beta.messages.with_raw_response.create(
-            max_tokens=max_tokens,
-            messages=messages,
-            model=model,
-            system=system,
-            tools=tool_collection.to_params(),
-            betas=[BETA_FLAG],
-        )
+            # Convert tools to Gemini function declarations
+            tools = [tool.to_gemini_tool() for tool in tool_collection.tools]
 
-        api_response_callback(cast(APIResponse[BetaMessage], raw_response))
+            # Convert messages to Gemini format
+            gemini_messages = []
+            for msg in messages:
+                if msg["role"] == "user":
+                    content = msg["content"]
+                    if isinstance(content, list):
+                        # Handle tool results
+                        text_content = "\n".join(
+                            block.get("text", "") 
+                            for block in content 
+                            if isinstance(block, dict) and block.get("type") == "text"
+                        )
+                        gemini_messages.append({"role": "user", "parts": [text_content]})
+                    else:
+                        gemini_messages.append({"role": "user", "parts": [content]})
+                elif msg["role"] == "assistant":
+                    content = msg["content"]
+                    if isinstance(content, list):
+                        text_content = "\n".join(
+                            block.get("text", "") 
+                            for block in content 
+                            if isinstance(block, dict) and block.get("type") == "text"
+                        )
+                        gemini_messages.append({"role": "model", "parts": [text_content]})
 
-        response = raw_response.parse()
+            # Call Gemini API
+            chat = model.start_chat(history=gemini_messages)
+            response = chat.send_message(
+                system,
+                tools=tools,
+                generation_config={"max_output_tokens": max_tokens}
+            )
 
-        messages.append(
-            {
+            # Convert Gemini response to our format
+            content_blocks = []
+            if response.text:
+                content_blocks.append({
+                    "type": "text",
+                    "text": response.text
+                })
+
+            if response.candidates[0].function_calls:
+                for tool_call in response.candidates[0].function_calls:
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": f"tool_{len(messages)}",
+                        "name": tool_call.name,
+                        "input": json.loads(tool_call.args)
+                    })
+
+            messages.append({
+                "role": "assistant",
+                "content": content_blocks
+            })
+
+            tool_result_content = []
+            for content_block in content_blocks:
+                output_callback(content_block)
+                if content_block["type"] == "tool_use":
+                    result = await tool_collection.run(
+                        name=content_block["name"],
+                        tool_input=content_block["input"],
+                    )
+                    tool_result_content.append(
+                        _make_api_tool_result(result, content_block["id"])
+                    )
+                    tool_output_callback(result, content_block["id"])
+
+        else:
+            # Original Anthropic logic
+            if provider == APIProvider.ANTHROPIC:
+                client = Anthropic(api_key=api_key)
+            elif provider == APIProvider.VERTEX:
+                client = AnthropicVertex()
+            elif provider == APIProvider.BEDROCK:
+                client = AnthropicBedrock()
+
+            raw_response = client.beta.messages.with_raw_response.create(
+                max_tokens=max_tokens,
+                messages=messages,
+                model=model,
+                system=system,
+                tools=tool_collection.to_params(),
+                betas=[BETA_FLAG],
+            )
+
+            api_response_callback(cast(APIResponse[BetaMessage], raw_response))
+            response = raw_response.parse()
+
+            messages.append({
                 "role": "assistant",
                 "content": cast(list[BetaContentBlockParam], response.content),
-            }
-        )
+            })
 
-        tool_result_content: list[BetaToolResultBlockParam] = []
-        for content_block in cast(list[BetaContentBlock], response.content):
-            print("CONTENT", content_block)
-            output_callback(content_block)
-            if content_block.type == "tool_use":
-                result = await tool_collection.run(
-                    name=content_block.name,
-                    tool_input=cast(dict[str, Any], content_block.input),
-                )
-                tool_result_content.append(
-                    _make_api_tool_result(result, content_block.id)
-                )
-                tool_output_callback(result, content_block.id)
+            tool_result_content = []
+            for content_block in cast(list[BetaContentBlock], response.content):
+                print("CONTENT", content_block)
+                output_callback(content_block)
+                if content_block.type == "tool_use":
+                    result = await tool_collection.run(
+                        name=content_block.name,
+                        tool_input=cast(dict[str, Any], content_block.input),
+                    )
+                    tool_result_content.append(
+                        _make_api_tool_result(result, content_block.id)
+                    )
+                    tool_output_callback(result, content_block.id)
 
         if not tool_result_content:
             return messages
